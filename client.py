@@ -3,20 +3,18 @@ import json
 import threading
 import pygame
 import sys
-import time
 import math
 import random
 from enum import Enum
 
 class PredictionConfig:
     def __init__(self):
-        # Optimized prediction parameters
-        self.prediction_speed_multiplier = 1.15  # Slightly reduced for smoother movement
-        self.reconciliation_tolerance = 0.15     # Increased tolerance for fewer corrections
-        self.interpolation_factor = 0.25         # Smoother interpolation
-        self.max_prediction_time = 0.3          # Reduced for more accurate predictions
-        self.jitter_threshold = 0.05            # Threshold for jitter detection
-        self.smoothing_window = 5               # Number of positions to average
+        self.prediction_speed_multiplier = 1.2  # Slightly faster than server
+        self.reconciliation_tolerance = 2.0  # Pixels
+        self.interpolation_factor = 0.3  # Smoothing factor
+        self.max_prediction_time = 0.5  # Maximum time to predict ahead
+        self.jitter_threshold = 5.0  # Minimum movement to consider
+        self.smoothing_window = 5  # Number of positions to average
 
 class EventType(Enum):
     ILLNESS = "illness"
@@ -31,6 +29,9 @@ class EventType(Enum):
     ENCOUNTER = "encounter"
     WEATHER_CHAIN = "weather_chain"
     RESOURCE_CHAIN = "resource_chain"
+    COOPERATIVE = "cooperative"
+    ENVIRONMENTAL = "environmental"
+    HIDDEN_LOCATION = "hidden_location"
 
 class SkillType(Enum):
     HUNTING = "hunting"
@@ -46,33 +47,28 @@ class GameClient:
         self.socket = None
         self.game_state = None
         self.player_name = None
-        self.running = True
         self.prediction_config = PredictionConfig()
-        self.last_update_time = time.time()
-        self.predicted_position = 0
-        self.last_server_position = 0
-        self.pending_actions = []
+        self.skills = {skill: 1 for skill in SkillType}
         self.position_history = []
-        self.skill_levels = {
-            SkillType.HUNTING: 1,
-            SkillType.GATHERING: 1,
-            SkillType.REPAIR: 1,
-            SkillType.NAVIGATION: 1,
-            SkillType.TRADING: 1
-        }
         self.debug_info = {
-            "latency": 0,
-            "prediction_error": 0,
+            "latency": [],
+            "prediction_error": [],
             "corrections": 0,
-            "jitter": 0,
-            "skill_checks": {},
-            "event_chains": [],
+            "jitter": [],
+            "skill_checks": 0,
+            "event_chains": 0,
             "network_stats": {
                 "packets_sent": 0,
                 "packets_received": 0,
-                "average_latency": 0
+                "bytes_sent": 0,
+                "bytes_received": 0
             }
         }
+        self.last_update_time = 0
+        self.predicted_position = None
+        self.last_server_position = None
+        self.event_chain_progress = 0
+        self.show_debug = False
 
     def connect(self, player_name):
         self.player_name = player_name
@@ -80,391 +76,437 @@ class GameClient:
         self.socket.connect((self.host, self.port))
         threading.Thread(target=self.receive_updates, daemon=True).start()
 
-    def predict_position(self, current_time):
-        if not self.game_state:
-            return self.predicted_position
-
-        player = next((p for p in self.game_state["players"] 
-                      if p["name"] == self.player_name), None)
-        if not player:
-            return self.predicted_position
-
-        delta_time = current_time - self.last_update_time
-        
-        if delta_time < self.prediction_config.max_prediction_time:
-            # Calculate predicted position
-            predicted = player["position"] + (
-                delta_time * self.prediction_config.prediction_speed_multiplier
-            )
-            
-            # Add to position history
-            self.position_history.append(predicted)
-            if len(self.position_history) > self.prediction_config.smoothing_window:
-                self.position_history.pop(0)
-            
-            # Calculate smoothed position
-            self.predicted_position = sum(self.position_history) / len(self.position_history)
-            
-            # Calculate jitter
-            if len(self.position_history) > 1:
-                jitter = sum(abs(self.position_history[i] - self.position_history[i-1]) 
-                           for i in range(1, len(self.position_history)))
-                self.debug_info["jitter"] = jitter / (len(self.position_history) - 1)
-        
-        return self.predicted_position
-
-    def reconcile_position(self, server_position):
-        error = abs(self.predicted_position - server_position)
-        self.debug_info["prediction_error"] = error
-
-        if error > self.prediction_config.reconciliation_tolerance:
-            self.debug_info["corrections"] += 1
-            
-            # Adjust interpolation factor based on error magnitude
-            factor = min(0.5, max(0.1, error * 2))
-            
-            # Smoothly interpolate to the correct position
-            self.predicted_position = (
-                self.predicted_position * (1 - factor) +
-                server_position * factor
-            )
-            
-            # Clear position history on large corrections
-            if error > self.prediction_config.jitter_threshold * 2:
-                self.position_history.clear()
-                self.position_history.append(server_position)
-        
-        self.last_server_position = server_position
-
-    def handle_skill_check(self, skill_type, difficulty):
-        skill_level = self.skill_levels[skill_type]
-        success_chance = min(0.95, 0.5 + (skill_level * 0.1))
-        success = random.random() < success_chance
-        
-        if success and random.random() < 0.3:  # 30% chance to improve skill
-            self.skill_levels[skill_type] = min(5, skill_level + 1)
-        
-        self.debug_info["skill_checks"][skill_type.value] = {
-            "success": success,
-            "difficulty": difficulty,
-            "skill_level": skill_level
-        }
-        
-        return success
-
     def receive_updates(self):
-        while self.running:
+        while True:
             try:
-                start_time = time.time()
                 data = self.socket.recv(4096)
                 if not data:
                     break
-                
-                self.game_state = json.loads(data.decode())
-                latency = time.time() - start_time
-                
-                # Update network stats
                 self.debug_info["network_stats"]["packets_received"] += 1
-                self.debug_info["network_stats"]["average_latency"] = (
-                    (self.debug_info["network_stats"]["average_latency"] * 
-                     (self.debug_info["network_stats"]["packets_received"] - 1) +
-                     latency) / self.debug_info["network_stats"]["packets_received"]
-                )
+                self.debug_info["network_stats"]["bytes_received"] += len(data)
                 
-                # Handle event chains
-                if "event_chains" in self.game_state:
-                    self.debug_info["event_chains"] = self.game_state["event_chains"]
+                game_state = json.loads(data.decode())
+                self.last_update_time = pygame.time.get_ticks()
                 
-                # Reconcile positions
-                player = next((p for p in self.game_state["players"] 
-                             if p["name"] == self.player_name), None)
-                if player:
-                    self.reconcile_position(player["position"])
+                # Update debug info
+                if self.predicted_position is not None:
+                    server_pos = next((p["position"] for p in game_state["players"] 
+                                     if p["name"] == self.player_name), None)
+                    if server_pos is not None:
+                        error = abs(server_pos - self.predicted_position)
+                        self.debug_info["prediction_error"].append(error)
+                        if error > self.prediction_config.reconciliation_tolerance:
+                            self.debug_info["corrections"] += 1
                 
-                self.last_update_time = time.time()
+                self.game_state = game_state
             except Exception as e:
                 print("Error receiving update:", e)
                 break
-        self.socket.close()
+
+    def predict_position(self, current_pos, direction):
+        if not self.position_history:
+            return current_pos + direction
+
+        # Calculate average velocity
+        velocities = []
+        for i in range(1, len(self.position_history)):
+            dt = self.position_history[i][1] - self.position_history[i-1][1]
+            if dt > 0:
+                velocity = (self.position_history[i][0] - self.position_history[i-1][0]) / dt
+                velocities.append(velocity)
+
+        if velocities:
+            avg_velocity = sum(velocities) / len(velocities)
+            # Apply smoothing
+            smoothed_velocity = avg_velocity * self.prediction_config.interpolation_factor + \
+                              direction * (1 - self.prediction_config.interpolation_factor)
+            
+            # Predict position
+            prediction_time = min(self.prediction_config.max_prediction_time,
+                                (pygame.time.get_ticks() - self.last_update_time) / 1000.0)
+            predicted_pos = current_pos + smoothed_velocity * prediction_time * \
+                          self.prediction_config.prediction_speed_multiplier
+            
+            # Store prediction
+            self.predicted_position = predicted_pos
+            return predicted_pos
+        return current_pos + direction
+
+    def reconcile_position(self, server_pos):
+        if self.predicted_position is not None:
+            error = abs(server_pos - self.predicted_position)
+            if error > self.prediction_config.reconciliation_tolerance:
+                # Calculate correction factor
+                correction = (server_pos - self.predicted_position) * \
+                           self.prediction_config.interpolation_factor
+                return server_pos + correction
+        return server_pos
+
+    def handle_skill_check(self, skill_type, difficulty):
+        skill_level = self.skills.get(skill_type, 1)
+        success_chance = 0.5 + (skill_level * 0.1) - (difficulty * 0.1)
+        success = random.random() < success_chance
+        
+        # Chance to improve skill
+        if success and random.random() < 0.3:
+            self.skills[skill_type] = min(5, self.skills[skill_type] + 1)
+        
+        self.debug_info["skill_checks"] += 1
+        return success
 
     def send_action(self, action, choice=None):
-        if self.socket:
-            try:
-                message = {
-                    "player": self.player_name,
-                    "action": action,
-                    "timestamp": time.time(),
-                    "skills": {k.value: v for k, v in self.skill_levels.items()}
-                }
-                if choice:
-                    message["choice"] = choice
-                self.socket.sendall(json.dumps(message).encode())
-                self.pending_actions.append(message)
-                self.debug_info["network_stats"]["packets_sent"] += 1
-            except Exception as e:
-                print("Error sending action:", e)
+        if not self.socket:
+            return
+        
+        message = {
+            "player": self.player_name,
+            "action": action,
+            "skills": {skill.value: level for skill, level in self.skills.items()}
+        }
+        if choice:
+            message["choice"] = choice
+        
+        try:
+            data = json.dumps(message).encode()
+            self.socket.sendall(data)
+            self.debug_info["network_stats"]["packets_sent"] += 1
+            self.debug_info["network_stats"]["bytes_sent"] += len(data)
+        except Exception as e:
+            print("Error sending action:", e)
 
     def disconnect(self):
-        self.running = False
         if self.socket:
             self.socket.close()
 
 class GameUI:
-    def __init__(self, client):
+    def __init__(self, width=800, height=600):
         pygame.init()
-        self.client = client
-        self.screen = pygame.display.set_mode((1024, 768))
+        self.width = width
+        self.height = height
+        self.screen = pygame.display.set_mode((width, height))
         pygame.display.set_caption("Oregon Trail Multiplayer")
-        self.font = pygame.font.Font(None, 36)
-        self.small_font = pygame.font.Font(None, 24)
         self.clock = pygame.time.Clock()
+        self.font = pygame.font.Font(None, 24)
+        self.title_font = pygame.font.Font(None, 36)
         self.colors = {
-            "white": (255, 255, 255),
-            "black": (0, 0, 0),
-            "red": (255, 0, 0),
-            "green": (0, 255, 0),
-            "blue": (0, 0, 255),
-            "yellow": (255, 255, 0),
-            "orange": (255, 165, 0),
-            "purple": (128, 0, 128)
+            "background": (50, 50, 50),
+            "text": (255, 255, 255),
+            "trail": (139, 69, 19),
+            "player": (0, 255, 0),
+            "landmark": (255, 215, 0),
+            "event": (255, 165, 0),
+            "skill": (0, 191, 255),
+            "debug": (255, 0, 0)
+        }
+        self.layout = {
+            "status_panel": pygame.Rect(10, 10, 200, 300),
+            "event_panel": pygame.Rect(10, 320, 200, 200),
+            "trail_panel": pygame.Rect(220, 10, 560, 400),
+            "control_panel": pygame.Rect(220, 420, 560, 150),
+            "debug_panel": pygame.Rect(10, 530, 780, 60)
         }
         self.show_debug = False
-        self.debug_mode = 0  # 0: Basic, 1: Network, 2: Skills, 3: Events
-
-    def draw_debug_info(self):
-        if not self.show_debug:
-            return
-
-        if self.debug_mode == 0:  # Basic debug info
-            debug_texts = [
-                f"Latency: {self.client.debug_info['latency']*1000:.1f}ms",
-                f"Prediction Error: {self.client.debug_info['prediction_error']:.2f}",
-                f"Corrections: {self.client.debug_info['corrections']}",
-                f"Jitter: {self.client.debug_info['jitter']:.3f}",
-                f"Speed Multiplier: {self.client.prediction_config.prediction_speed_multiplier:.2f}",
-                f"Tolerance: {self.client.prediction_config.reconciliation_tolerance:.2f}"
-            ]
-        elif self.debug_mode == 1:  # Network stats
-            stats = self.client.debug_info["network_stats"]
-            debug_texts = [
-                f"Packets Sent: {stats['packets_sent']}",
-                f"Packets Received: {stats['packets_received']}",
-                f"Average Latency: {stats['average_latency']*1000:.1f}ms",
-                f"Packet Loss: {((stats['packets_sent'] - stats['packets_received']) / max(1, stats['packets_sent']) * 100):.1f}%"
-            ]
-        elif self.debug_mode == 2:  # Skills
-            debug_texts = ["Skill Levels:"]
-            for skill, level in self.client.skill_levels.items():
-                checks = self.client.debug_info["skill_checks"].get(skill.value, {})
-                success_rate = checks.get("success_rate", 0) if checks else 0
-                debug_texts.append(f"{skill.value}: {level} (Success: {success_rate:.1%})")
-        else:  # Event chains
-            debug_texts = ["Active Event Chains:"]
-            for chain in self.client.game_state["event_chains"]:
-                debug_texts.append(f"- {chain['type']}: {chain['progress']}/{chain['total']}")
-
-        y = 50
-        for text in debug_texts:
-            surface = self.small_font.render(text, True, self.colors["yellow"])
-            self.screen.blit(surface, (800, y))
-            y += 25
-
-    def draw_skill_bars(self):
-        y = 200
-        for skill, level in self.client.skill_levels.items():
-            # Draw skill name
-            surface = self.small_font.render(f"{skill.value}:", True, self.colors["white"])
-            self.screen.blit(surface, (20, y))
-            
-            # Draw skill bar
-            bar_width = 200
-            bar_height = 20
-            pygame.draw.rect(self.screen, self.colors["black"], (150, y, bar_width, bar_height), 1)
-            fill_width = (bar_width * level) / 5  # 5 is max level
-            pygame.draw.rect(self.screen, self.colors["green"], (150, y, fill_width, bar_height))
-            
-            y += 30
-
-    def draw_event_chains(self):
-        if not self.client.game_state or "event_chains" not in self.client.game_state:
-            return
-
-        y = 300
-        self.screen.blit(self.font.render("Active Events:", True, self.colors["white"]), (20, y))
-        y += 40
-
-        for chain in self.client.game_state["event_chains"]:
-            # Draw event chain progress
-            progress = chain["progress"] / chain["total"]
-            bar_width = 200
-            bar_height = 20
-            
-            pygame.draw.rect(self.screen, self.colors["black"], (20, y, bar_width, bar_height), 1)
-            fill_width = bar_width * progress
-            pygame.draw.rect(self.screen, self.colors["blue"], (20, y, fill_width, bar_height))
-            
-            # Draw event description
-            surface = self.small_font.render(chain["description"], True, self.colors["white"])
-            self.screen.blit(surface, (230, y))
-            
-            y += 30
+        self.custom_layout = False
 
     def draw_player_status(self, player_data):
-        y = 50
-        for player in player_data:
-            # Basic info
-            text = f"{player['name']}: Position {player['position']:.1f}"
-            surface = self.font.render(text, True, self.colors["white"])
-            self.screen.blit(surface, (20, y))
-            y += 30
-
-            # Resources
-            resources = [
-                f"Food: {player['food']}",
-                f"Ammo: {player['ammo']}",
-                f"Money: ${player['money']}",
-                f"Health: {player['health']}%",
-                f"Wagon: {player['wagon_condition']}%"
-            ]
-            for resource in resources:
-                surface = self.small_font.render(resource, True, self.colors["white"])
-                self.screen.blit(surface, (40, y))
-                y += 25
-
-            # Active effects
-            if player['active_effects']:
-                effects_text = "Active Effects: " + ", ".join(player['active_effects'])
-                surface = self.small_font.render(effects_text, True, self.colors["yellow"])
-                self.screen.blit(surface, (40, y))
-                y += 25
-
-            y += 20  # Add space between players
-
-    def draw_events(self, player_data):
         if not player_data:
             return
 
-        # Find current player
-        current_player = next((p for p in player_data if p['name'] == self.client.player_name), None)
-        if not current_player or not current_player['events']:
-            return
+        # Draw status panel background
+        pygame.draw.rect(self.screen, (30, 30, 30), self.layout["status_panel"])
+        pygame.draw.rect(self.screen, self.colors["text"], self.layout["status_panel"], 1)
 
-        # Draw event log
-        y = 400
-        self.screen.blit(self.font.render("Recent Events:", True, self.colors["white"]), (20, y))
-        y += 40
+        y = self.layout["status_panel"].top + 10
+        # Player name and position
+        name_text = self.font.render(f"Player: {player_data['name']}", True, self.colors["text"])
+        self.screen.blit(name_text, (self.layout["status_panel"].left + 10, y))
+        y += 30
 
-        for event in current_player['events']:
-            # Event description
-            surface = self.small_font.render(event['description'], True, self.colors["white"])
-            self.screen.blit(surface, (40, y))
+        # Resources
+        resources = [
+            ("Food", player_data["food"]),
+            ("Ammo", player_data["ammo"]),
+            ("Money", player_data["money"]),
+            ("Health", player_data["health"]),
+            ("Wagon", player_data["wagon_condition"])
+        ]
+
+        for resource, value in resources:
+            # Draw resource bar
+            bar_width = 150
+            bar_height = 20
+            bar_rect = pygame.Rect(self.layout["status_panel"].left + 10, y, bar_width, bar_height)
+            pygame.draw.rect(self.screen, (50, 50, 50), bar_rect)
+            
+            # Calculate fill width based on value
+            if resource in ["Health", "Wagon"]:
+                fill_width = int((value / 100) * bar_width)
+            else:
+                fill_width = int((value / 200) * bar_width)  # Assuming max of 200 for other resources
+            
+            fill_rect = pygame.Rect(bar_rect.left, bar_rect.top, fill_width, bar_height)
+            color = (0, 255, 0) if value > 50 else (255, 0, 0) if value < 20 else (255, 255, 0)
+            pygame.draw.rect(self.screen, color, fill_rect)
+            
+            # Draw text
+            text = self.font.render(f"{resource}: {value}", True, self.colors["text"])
+            self.screen.blit(text, (bar_rect.right + 10, y))
+            y += 30
+
+        # Skills
+        y += 10
+        skills_text = self.font.render("Skills:", True, self.colors["text"])
+        self.screen.blit(skills_text, (self.layout["status_panel"].left + 10, y))
+        y += 30
+
+        for skill, level in player_data.get("skills", {}).items():
+            # Draw skill bar
+            bar_width = 150
+            bar_height = 15
+            bar_rect = pygame.Rect(self.layout["status_panel"].left + 10, y, bar_width, bar_height)
+            pygame.draw.rect(self.screen, (50, 50, 50), bar_rect)
+            
+            # Calculate fill width based on skill level (1-5)
+            fill_width = int((level / 5) * bar_width)
+            fill_rect = pygame.Rect(bar_rect.left, bar_rect.top, fill_width, bar_height)
+            pygame.draw.rect(self.screen, self.colors["skill"], fill_rect)
+            
+            # Draw text
+            text = self.font.render(f"{skill}: {level}", True, self.colors["text"])
+            self.screen.blit(text, (bar_rect.right + 10, y))
             y += 25
 
-            # Event choices
-            if event['choices']:
-                for choice, description in event['choices'].items():
-                    color = self.colors["green"]
-                    surface = self.small_font.render(f"- {description}", True, color)
-                    self.screen.blit(surface, (60, y))
-                    y += 25
+        # Active effects
+        if player_data.get("effects"):
             y += 10
+            effects_text = self.font.render("Active Effects:", True, self.colors["text"])
+            self.screen.blit(effects_text, (self.layout["status_panel"].left + 10, y))
+            y += 30
+
+            for effect in player_data["effects"]:
+                text = self.font.render(effect, True, self.colors["event"])
+                self.screen.blit(text, (self.layout["status_panel"].left + 10, y))
+                y += 25
+
+    def draw_events(self, events):
+        # Draw event panel background
+        pygame.draw.rect(self.screen, (30, 30, 30), self.layout["event_panel"])
+        pygame.draw.rect(self.screen, self.colors["text"], self.layout["event_panel"], 1)
+
+        y = self.layout["event_panel"].top + 10
+        title = self.font.render("Recent Events:", True, self.colors["text"])
+        self.screen.blit(title, (self.layout["event_panel"].left + 10, y))
+        y += 30
+
+        for event in events[-5:]:  # Show last 5 events
+            text = self.font.render(event, True, self.colors["event"])
+            self.screen.blit(text, (self.layout["event_panel"].left + 10, y))
+            y += 25
+
+    def draw_trail(self, game_state):
+        if not game_state:
+            return
+
+        # Draw trail panel background
+        pygame.draw.rect(self.screen, (30, 30, 30), self.layout["trail_panel"])
+        pygame.draw.rect(self.screen, self.colors["text"], self.layout["trail_panel"], 1)
+
+        # Draw trail
+        trail_start = (self.layout["trail_panel"].left + 50, self.layout["trail_panel"].centery)
+        trail_end = (self.layout["trail_panel"].right - 50, self.layout["trail_panel"].centery)
+        pygame.draw.line(self.screen, self.colors["trail"], trail_start, trail_end, 5)
+
+        # Draw landmarks
+        for pos, name in game_state["landmarks"].items():
+            x = trail_start[0] + (pos / game_state["trail_length"]) * (trail_end[0] - trail_start[0])
+            y = trail_start[1]
+            pygame.draw.circle(self.screen, self.colors["landmark"], (int(x), int(y)), 10)
+            text = self.font.render(name, True, self.colors["landmark"])
+            self.screen.blit(text, (int(x) - text.get_width()//2, int(y) + 15))
+
+        # Draw players
+        for player in game_state["players"]:
+            x = trail_start[0] + (player["position"] / game_state["trail_length"]) * (trail_end[0] - trail_start[0])
+            y = trail_start[1]
+            pygame.draw.circle(self.screen, self.colors["player"], (int(x), int(y)), 8)
+            text = self.font.render(player["name"], True, self.colors["player"])
+            self.screen.blit(text, (int(x) - text.get_width()//2, int(y) - 20))
+
+        # Draw weather indicator
+        weather_text = self.font.render(f"Weather: {game_state['current_weather']}", True, self.colors["text"])
+        self.screen.blit(weather_text, (self.layout["trail_panel"].left + 10, self.layout["trail_panel"].top + 10))
 
     def draw_controls(self):
+        # Draw control panel background
+        pygame.draw.rect(self.screen, (30, 30, 30), self.layout["control_panel"])
+        pygame.draw.rect(self.screen, self.colors["text"], self.layout["control_panel"], 1)
+
+        y = self.layout["control_panel"].top + 10
         controls = [
             "Controls:",
-            "M - Move",
-            "H - Hunt",
-            "B - Buy Food",
-            "R - Rest",
-            "P - Repair Wagon",
-            "D - Toggle Debug Info",
-            "TAB - Switch Debug Mode",
+            "W/S - Move forward/backward",
+            "H - Hunt for food",
+            "B - Buy food",
+            "R - Repair wagon",
+            "D - Toggle debug info",
+            "L - Toggle layout",
             "Q - Quit"
         ]
-        y = 600
-        for text in controls:
-            surface = self.font.render(text, True, self.colors["white"])
-            self.screen.blit(surface, (20, y))
-            y += 40
 
-    def draw_weather(self):
-        if self.client.game_state:
-            weather_text = f"Weather: {self.client.game_state['current_weather']}"
-            surface = self.font.render(weather_text, True, self.colors["white"])
-            self.screen.blit(surface, (20, 700))
+        for control in controls:
+            text = self.font.render(control, True, self.colors["text"])
+            self.screen.blit(text, (self.layout["control_panel"].left + 10, y))
+            y += 25
 
-    def handle_event_click(self, pos):
-        if not self.client.game_state:
+    def draw_debug_info(self, debug_info):
+        if not self.show_debug:
             return
 
-        current_player = next((p for p in self.client.game_state['players'] 
-                             if p['name'] == self.client.player_name), None)
-        if not current_player or not current_player['events']:
+        # Draw debug panel background
+        pygame.draw.rect(self.screen, (30, 30, 30), self.layout["debug_panel"])
+        pygame.draw.rect(self.screen, self.colors["debug"], self.layout["debug_panel"], 1)
+
+        y = self.layout["debug_panel"].top + 10
+        debug_texts = [
+            f"Latency: {sum(debug_info['latency'][-10:])/len(debug_info['latency'][-10:]) if debug_info['latency'] else 0:.2f}ms",
+            f"Prediction Error: {sum(debug_info['prediction_error'][-10:])/len(debug_info['prediction_error'][-10:]) if debug_info['prediction_error'] else 0:.2f}",
+            f"Corrections: {debug_info['corrections']}",
+            f"Skill Checks: {debug_info['skill_checks']}",
+            f"Event Chains: {debug_info['event_chains']}",
+            f"Network: {debug_info['network_stats']['packets_sent']}/{debug_info['network_stats']['packets_received']} packets"
+        ]
+
+        x = self.layout["debug_panel"].left + 10
+        for text in debug_texts:
+            debug_text = self.font.render(text, True, self.colors["debug"])
+            self.screen.blit(debug_text, (x, y))
+            x += 150
+
+    def draw_skill_bars(self, skills):
+        if not skills:
             return
 
-        y = 440  # Starting y position for events
-        for event in current_player['events']:
-            if event['choices']:
-                for choice, description in event['choices'].items():
-                    choice_rect = pygame.Rect(60, y, 300, 25)
-                    if choice_rect.collidepoint(pos):
-                        self.client.send_action("event_choice", {
-                            "event_time": event['timestamp'],
-                            "choice": choice
-                        })
-                        return
-                    y += 25
-            y += 35
+        y = self.layout["status_panel"].bottom + 10
+        for skill, level in skills.items():
+            # Draw skill bar
+            bar_width = 150
+            bar_height = 15
+            bar_rect = pygame.Rect(self.layout["status_panel"].left + 10, y, bar_width, bar_height)
+            pygame.draw.rect(self.screen, (50, 50, 50), bar_rect)
+            
+            # Calculate fill width based on skill level (1-5)
+            fill_width = int((level / 5) * bar_width)
+            fill_rect = pygame.Rect(bar_rect.left, bar_rect.top, fill_width, bar_height)
+            pygame.draw.rect(self.screen, self.colors["skill"], fill_rect)
+            
+            # Draw text
+            text = self.font.render(f"{skill}: {level}", True, self.colors["text"])
+            self.screen.blit(text, (bar_rect.right + 10, y))
+            y += 25
 
-    def run(self):
-        while True:
-            current_time = time.time()
+    def draw_event_chains(self, event_chains):
+        if not event_chains:
+            return
+
+        y = self.layout["event_panel"].top + 10
+        for chain in event_chains:
+            # Draw event chain progress
+            bar_width = 150
+            bar_height = 15
+            bar_rect = pygame.Rect(self.layout["event_panel"].left + 10, y, bar_width, bar_height)
+            pygame.draw.rect(self.screen, (50, 50, 50), bar_rect)
+            
+            # Calculate fill width based on progress
+            fill_width = int((chain["progress"] / chain["total_steps"]) * bar_width)
+            fill_rect = pygame.Rect(bar_rect.left, bar_rect.top, fill_width, bar_height)
+            pygame.draw.rect(self.screen, self.colors["event"], fill_rect)
+            
+            # Draw text
+            text = self.font.render(f"{chain['type']}: {chain['progress']}/{chain['total_steps']}", 
+                                  True, self.colors["text"])
+            self.screen.blit(text, (bar_rect.right + 10, y))
+            y += 25
+
+    def toggle_layout(self):
+        self.custom_layout = not self.custom_layout
+        if self.custom_layout:
+            # Custom layout with larger trail panel
+            self.layout = {
+                "status_panel": pygame.Rect(10, 10, 150, 300),
+                "event_panel": pygame.Rect(10, 320, 150, 200),
+                "trail_panel": pygame.Rect(170, 10, 620, 400),
+                "control_panel": pygame.Rect(170, 420, 620, 150),
+                "debug_panel": pygame.Rect(10, 530, 780, 60)
+            }
+        else:
+            # Default layout
+            self.layout = {
+                "status_panel": pygame.Rect(10, 10, 200, 300),
+                "event_panel": pygame.Rect(10, 320, 200, 200),
+                "trail_panel": pygame.Rect(220, 10, 560, 400),
+                "control_panel": pygame.Rect(220, 420, 560, 150),
+                "debug_panel": pygame.Rect(10, 530, 780, 60)
+            }
+
+    def run(self, client):
+        running = True
+        while running:
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
-                    self.client.disconnect()
-                    pygame.quit()
-                    return
+                    running = False
                 elif event.type == pygame.KEYDOWN:
-                    if event.key == pygame.K_m:
-                        self.client.send_action("move")
+                    if event.key == pygame.K_w:
+                        client.send_action("move", {"direction": 1})
+                    elif event.key == pygame.K_s:
+                        client.send_action("move", {"direction": -1})
                     elif event.key == pygame.K_h:
-                        self.client.send_action("hunt")
+                        client.send_action("hunt")
                     elif event.key == pygame.K_b:
-                        self.client.send_action("buy_food")
+                        client.send_action("buy_food")
                     elif event.key == pygame.K_r:
-                        self.client.send_action("rest")
-                    elif event.key == pygame.K_p:
-                        self.client.send_action("repair")
+                        client.send_action("repair_wagon")
                     elif event.key == pygame.K_d:
                         self.show_debug = not self.show_debug
-                    elif event.key == pygame.K_TAB and self.show_debug:
-                        self.debug_mode = (self.debug_mode + 1) % 4
+                    elif event.key == pygame.K_l:
+                        self.toggle_layout()
                     elif event.key == pygame.K_q:
-                        self.client.disconnect()
-                        pygame.quit()
-                        return
-                elif event.type == pygame.MOUSEBUTTONDOWN:
-                    if event.button == 1:  # Left click
-                        self.handle_event_click(event.pos)
+                        running = False
 
-            self.screen.fill(self.colors["black"])
-            if self.client.game_state:
-                self.client.predict_position(current_time)
-                self.draw_player_status(self.client.game_state['players'])
-                self.draw_events(self.client.game_state['players'])
-                self.draw_skill_bars()
-                self.draw_event_chains()
-            self.draw_controls()
-            self.draw_weather()
-            self.draw_debug_info()
+            # Clear screen
+            self.screen.fill(self.colors["background"])
+
+            # Draw game state
+            if client.game_state:
+                player_data = next((p for p in client.game_state["players"] 
+                                  if p["name"] == client.player_name), None)
+                if player_data:
+                    self.draw_player_status(player_data)
+                    self.draw_events(player_data.get("event_log", []))
+                    self.draw_trail(client.game_state)
+                    self.draw_controls()
+                    if self.show_debug:
+                        self.draw_debug_info(client.debug_info)
+                    self.draw_skill_bars(player_data.get("skills", {}))
+                    self.draw_event_chains(client.game_state.get("event_chains", []))
+
+            # Update display
             pygame.display.flip()
             self.clock.tick(60)
 
+        pygame.quit()
+        client.disconnect()
+
 def main():
+    if len(sys.argv) != 2:
+        print("Usage: python client.py <player_name>")
+        return
+
+    player_name = sys.argv[1]
     client = GameClient()
-    client.connect("Player1")  # You can make this dynamic
-    ui = GameUI(client)
-    ui.run()
+    client.connect(player_name)
+    
+    ui = GameUI()
+    ui.run(client)
 
 if __name__ == "__main__":
     main() 

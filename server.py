@@ -8,9 +8,9 @@ from enum import Enum
 class EventType(Enum):
     ILLNESS = "illness"
     WEATHER = "weather"
-    BANDITS = "bandits"
-    TRADING_POST = "trading_post"
+    TRADING = "trading"
     HUNTING = "hunting"
+    WAGON_DAMAGE = "wagon_damage"
 
 class Event:
     def __init__(self, type, description, choices=None, effects=None):
@@ -38,8 +38,8 @@ class Player:
         self.money = money
         self.health = health
         self.wagon_condition = wagon_condition
-        self.active_effects = []
-        self.events = []
+        self.effects = []  # List of active effects (illness, weather effects, etc.)
+        self.event_log = []  # Recent events affecting this player
 
     def to_dict(self):
         return {
@@ -50,8 +50,8 @@ class Player:
             "money": self.money,
             "health": self.health,
             "wagon_condition": self.wagon_condition,
-            "active_effects": self.active_effects,
-            "events": [event.to_dict() for event in self.events[-5:]]  # Keep last 5 events
+            "effects": self.effects,
+            "event_log": self.event_log[-5:]  # Keep only last 5 events
         }
 
     @staticmethod
@@ -65,8 +65,21 @@ class Player:
             data.get("health", 100),
             data.get("wagon_condition", 100)
         )
-        player.active_effects = data.get("active_effects", [])
+        player.effects = data.get("effects", [])
+        player.event_log = data.get("event_log", [])
         return player
+
+    def add_event(self, event):
+        self.event_log.append(event)
+        if len(self.event_log) > 10:  # Keep only last 10 events
+            self.event_log.pop(0)
+
+    def add_effect(self, effect):
+        self.effects.append(effect)
+
+    def remove_effect(self, effect):
+        if effect in self.effects:
+            self.effects.remove(effect)
 
     def consume_food(self, amount):
         self.food = max(0, self.food - amount)
@@ -102,84 +115,115 @@ class Player:
 
 class GameState:
     def __init__(self):
-        self.players = []
-        self.day = 1
+        self.players = {}  # Dictionary of Player objects
         self.trail_length = 100
         self.landmarks = {
             10: "Independence",
             30: "Fort Kearney",
-            50: "Fort Laramie",
-            70: "Fort Bridger",
-            90: "Fort Hall"
+            50: "Chimney Rock",
+            70: "Fort Laramie",
+            90: "Oregon City"
         }
-        self.weather_conditions = ["Clear", "Rain", "Storm", "Heat Wave"]
-        self.current_weather = "Clear"
+        self.current_weather = "clear"
+        self.day = 1
+        self.last_snapshot_time = time.time()
+        self.snapshot_interval = 0.1  # Send snapshots every 100ms
+
+    def update(self, actions):
+        """Updates the game state based on player actions."""
+        current_time = time.time()
+        
+        # Process player actions
+        for player_name, action in actions.items():
+            player = self.players.get(player_name)
+            if not player:
+                continue
+
+            if action == "move":
+                player.position = min(player.position + 1, self.trail_length)
+                player.food = max(0, player.food - 5)
+                self._check_landmark(player)
+                self._apply_weather_effects(player)
+                self._check_random_events(player)
+
+            elif action == "hunt":
+                if player.ammo >= 2:
+                    player.use_ammo(2)
+                    success = random.random() < 0.7  # 70% chance of successful hunt
+                    if success:
+                        food_gained = random.randint(15, 25)
+                        player.add_food(food_gained)
+                        player.add_event(f"Successfully hunted and gained {food_gained} food")
+                    else:
+                        player.add_event("Hunting attempt failed")
+
+            elif action == "buy_food":
+                if player.spend_money(10):
+                    player.add_food(15)
+                    player.add_event("Bought 15 food for 10 money")
+
+            elif action == "repair_wagon":
+                if player.spend_money(20):
+                    player.wagon_condition = min(100, player.wagon_condition + 30)
+                    player.add_event("Repaired wagon (+30 condition)")
+
+        # Update weather periodically
+        if current_time - self.last_snapshot_time >= 5:  # Change weather every 5 seconds
+            self._update_weather()
+
+    def _check_landmark(self, player):
+        """Check if player has reached a landmark."""
+        if player.position in self.landmarks:
+            player.add_event(f"Reached {self.landmarks[player.position]}!")
+            # Add special landmark effects here
+
+    def _apply_weather_effects(self, player):
+        """Apply effects based on current weather."""
+        if self.current_weather == "storm":
+            player.wagon_condition = max(0, player.wagon_condition - 5)
+            player.add_event("Storm damaged wagon (-5 condition)")
+        elif self.current_weather == "heat":
+            player.food = max(0, player.food - 2)
+            player.add_event("Hot weather spoiled some food (-2 food)")
+
+    def _check_random_events(self, player):
+        """Check for random events that might occur."""
+        if random.random() < 0.1:  # 10% chance of random event
+            event_type = random.choice(list(EventType))
+            if event_type == EventType.ILLNESS:
+                player.health = max(0, player.health - 20)
+                player.add_effect("illness")
+                player.add_event("Fell ill! Health -20")
+            elif event_type == EventType.WAGON_DAMAGE:
+                player.wagon_condition = max(0, player.wagon_condition - 15)
+                player.add_event("Wagon damage! -15 condition")
+
+    def _update_weather(self):
+        """Update the weather state."""
+        weathers = ["clear", "storm", "heat", "rain"]
+        self.current_weather = random.choice(weathers)
 
     def to_dict(self):
+        """Converts the game state to a dictionary for JSON serialization."""
         return {
-            "players": [p.to_dict() for p in self.players],
-            "day": self.day,
+            "players": [player.to_dict() for player in self.players.values()],
             "trail_length": self.trail_length,
             "landmarks": self.landmarks,
-            "current_weather": self.current_weather
+            "current_weather": self.current_weather,
+            "day": self.day
         }
 
-    @staticmethod
-    def from_dict(data):
-        game_state = GameState()
-        game_state.players = [Player.from_dict(p) for p in data["players"]]
-        game_state.day = data["day"]
+    @classmethod
+    def from_dict(cls, data):
+        """Creates a GameState object from a dictionary."""
+        game_state = cls()
+        game_state.players = {player["name"]: Player.from_dict(player) 
+                            for player in data["players"]}
         game_state.trail_length = data["trail_length"]
         game_state.landmarks = data["landmarks"]
         game_state.current_weather = data["current_weather"]
+        game_state.day = data["day"]
         return game_state
-
-    def generate_event(self, player):
-        if random.random() < 0.3:  # 30% chance of event
-            event_type = random.choice(list(EventType))
-            if event_type == EventType.ILLNESS:
-                return Event(
-                    EventType.ILLNESS,
-                    "You're feeling sick!",
-                    {
-                        "rest": "Rest for a day (lose 1 day, recover 20 health)",
-                        "continue": "Continue traveling (risk worsening condition)"
-                    },
-                    {
-                        "rest": {"health": 20, "day": 1},
-                        "continue": {"health": -10}
-                    }
-                )
-            elif event_type == EventType.WEATHER:
-                weather = random.choice(self.weather_conditions)
-                return Event(
-                    EventType.WEATHER,
-                    f"The weather has changed to {weather}!",
-                    {
-                        "continue": "Continue traveling",
-                        "wait": "Wait for better weather"
-                    },
-                    {
-                        "continue": {"wagon_condition": -5 if weather == "Storm" else 0},
-                        "wait": {"day": 1}
-                    }
-                )
-            elif event_type == EventType.TRADING_POST:
-                return Event(
-                    EventType.TRADING_POST,
-                    "You've found a trading post!",
-                    {
-                        "buy_food": "Buy food (10 money for 15 food)",
-                        "buy_ammo": "Buy ammo (5 money for 10 ammo)",
-                        "repair": "Repair wagon (20 money for 30 condition)"
-                    },
-                    {
-                        "buy_food": {"money": -10, "food": 15},
-                        "buy_ammo": {"money": -5, "ammo": 10},
-                        "repair": {"money": -20, "wagon_condition": 30}
-                    }
-                )
-        return None
 
 class GameServer:
     def __init__(self, host='127.0.0.1', port=50000):
@@ -187,90 +231,27 @@ class GameServer:
         self.port = port
         self.clients = []
         self.game_state = GameState()
-        self.last_snapshot_time = time.time()
-        self.snapshot_interval = 1.0  # Send snapshots every second
+        self.running = True
 
     def broadcast_game_state(self):
-        current_time = time.time()
-        if current_time - self.last_snapshot_time >= self.snapshot_interval:
-            self.last_snapshot_time = current_time
-            serialized = json.dumps(self.game_state.to_dict()).encode()
-            for client in self.clients:
-                try:
-                    client.sendall(serialized)
-                except Exception as e:
-                    print("Error sending to client:", e)
-
-    def handle_action(self, player_name, action, choice=None):
-        player = next((p for p in self.game_state.players if p.name == player_name), None)
-        if not player:
-            player = Player(player_name)
-            self.game_state.players.append(player)
-
-        if action == "move":
-            player.position += 1
-            player.consume_food(5)
-            # Check for landmarks
-            if player.position in self.game_state.landmarks:
-                player.events.append(Event(
-                    EventType.TRADING_POST,
-                    f"You've reached {self.game_state.landmarks[player.position]}!"
-                ))
-        elif action == "hunt":
-            if player.ammo >= 2:
-                player.use_ammo(2)
-                if random.random() < 0.7:  # 70% success rate
-                    player.add_food(20)
-                    player.events.append(Event(
-                        EventType.HUNTING,
-                        "Successful hunt! Gained 20 food."
-                    ))
-                else:
-                    player.events.append(Event(
-                        EventType.HUNTING,
-                        "The hunt was unsuccessful."
-                    ))
-        elif action == "event_choice" and choice:
-            event = next((e for e in player.events if e.timestamp == choice["event_time"]), None)
-            if event and choice["choice"] in event.effects:
-                effects = event.effects[choice["choice"]]
-                for key, value in effects.items():
-                    if key == "health":
-                        player.modify_health(value)
-                    elif key == "food":
-                        player.add_food(value)
-                    elif key == "ammo":
-                        player.add_ammo(value)
-                    elif key == "money":
-                        if value < 0:
-                            player.spend_money(abs(value))
-                        else:
-                            player.earn_money(value)
-                    elif key == "wagon_condition":
-                        if value < 0:
-                            player.damage_wagon(abs(value))
-                        else:
-                            player.repair_wagon(value)
-                    elif key == "day":
-                        self.game_state.day += value
-
-        # Generate new event
-        new_event = self.game_state.generate_event(player)
-        if new_event:
-            player.events.append(new_event)
-
-        # Update weather
-        if random.random() < 0.1:  # 10% chance of weather change
-            self.game_state.current_weather = random.choice(self.game_state.weather_conditions)
+        """Broadcasts the current game state to all connected clients."""
+        state_dict = self.game_state.to_dict()
+        serialized = json.dumps(state_dict).encode()
+        for client in self.clients:
+            try:
+                client.sendall(serialized)
+            except Exception as e:
+                print("Error sending to client:", e)
 
     def handle_client(self, client_socket):
+        """Handles communication with a single client."""
         try:
-            while True:
+            while self.running:
                 data = client_socket.recv(4096)
                 if not data:
                     break
                 action = json.loads(data.decode())
-                self.handle_action(action["player"], action["action"], action.get("choice"))
+                self.game_state.update({action["player"]: action["action"]})
                 self.broadcast_game_state()
         except Exception as e:
             print("Client error:", e)
@@ -279,15 +260,24 @@ class GameServer:
             client_socket.close()
 
     def start(self):
+        """Starts the game server."""
         server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         server_socket.bind((self.host, self.port))
         server_socket.listen()
         print("Server listening on", self.port)
-        while True:
-            client_socket, addr = server_socket.accept()
-            print("Connected to", addr)
-            self.clients.append(client_socket)
-            threading.Thread(target=self.handle_client, args=(client_socket,), daemon=True).start()
+
+        try:
+            while self.running:
+                client_socket, addr = server_socket.accept()
+                print("Connected to", addr)
+                self.clients.append(client_socket)
+                threading.Thread(target=self.handle_client, 
+                               args=(client_socket,), 
+                               daemon=True).start()
+        except KeyboardInterrupt:
+            print("Shutting down server...")
+            self.running = False
+            server_socket.close()
 
 if __name__ == "__main__":
     GameServer().start() 
